@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   getOzoneReadings,
   getReadingHistory,
@@ -15,6 +15,7 @@ import {
   SAMPLE_INTERVAL_S,
 } from './api/ozone'
 import ClimateCard from './components/ClimateCard.vue'
+import PicoControl from './components/PicoControl.vue'
 
 const readings = ref<OzoneReadings | null>(null)
 const history = ref<OzoneRecordSummary[]>([])
@@ -104,6 +105,17 @@ async function refreshReadings() {
   await loadReading(history.value[0]?.id)
 }
 
+let liveRefreshTimer: ReturnType<typeof setTimeout> | undefined
+async function refreshLiveReadings() {
+  if (selectedId.value && !isLatest.value) return
+  if (loading.value) {
+    clearTimeout(liveRefreshTimer)
+    liveRefreshTimer = setTimeout(() => { void refreshLiveReadings() }, 500)
+    return
+  }
+  await refreshReadings()
+}
+
 function selectRecord(index: number) {
   const record = history.value[index]
   if (record) void loadReading(record.id)
@@ -112,6 +124,7 @@ function selectRecord(index: number) {
 onMounted(() => {
   void refreshReadings()
 })
+onUnmounted(() => { clearTimeout(liveRefreshTimer) })
 
 </script>
 
@@ -124,7 +137,7 @@ onMounted(() => {
       </a>
       <div class="connection">
         <span class="connection-dot" :class="{ 'is-online': readings && !errorMessage }"></span>
-        {{ errorMessage ? 'Needs attention' : readings ? 'Connected' : 'Connecting' }}
+        {{ errorMessage ? 'Data needs attention' : readings ? 'Data available' : 'Loading data' }}
       </div>
     </header>
 
@@ -143,6 +156,8 @@ onMounted(() => {
         </button>
       </div>
     </section>
+
+    <PicoControl @readings-changed="refreshLiveReadings" />
 
     <section v-if="history.length" class="history-bar" aria-label="Choose a reading">
       <button

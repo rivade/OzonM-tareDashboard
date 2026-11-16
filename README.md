@@ -5,7 +5,7 @@ temperature and humidity, stored in MongoDB. A Raspberry Pi Pico reads the
 sensors and uploads the values.
 
 MQ135 readings are stored as **raw 16-bit ADC values (0–65535)** and shown on the
-dashboard as a sensor voltage, converted the same way as on the Pico's LCD:
+dashboard as a sensor voltage:
 `volts = raw / 65535 × 3.3 × 1.5` (the 1.5 undoes the 10k/20k divider). Bars and
 cards are coloured by level: green (**Good**) below 1.2 V, yellow (**Moderate**)
 from 1.2 V and red (**Poor / High Gas**) from 2.2 V. The thresholds are
@@ -28,10 +28,9 @@ API_HOST=127.0.0.1
 API_TOKEN=a-long-random-secret
 ```
 
-- `API_HOST=127.0.0.1` keeps the API reachable from this computer only, which
-  is all the USB bridge needs.
-- `API_TOKEN` is the shared secret the Pico sends when uploading. Uploads are
-  rejected without it. A random one is already generated in `.env`.
+- `API_HOST=127.0.0.1` keeps the API on this computer. The API polls the Pico and saves readings directly.
+- `API_TOKEN` protects the optional external `POST /api/readings` endpoint; the Pico does not need it.
+- `PICO_URL` optionally changes the Pico address (default `http://192.168.4.1`).
 
 Each document is one 1-minute window of up to 30 readings, 2 seconds apart:
 
@@ -58,12 +57,14 @@ The `.env` file is ignored by Git. `.env.example` lists the required settings.
 
 ```sh
 npm install
-npm run api
+npm run live
 npm run dev
 ```
 
 Endpoints on `http://localhost:8001`:
 
+- `GET /api/pico/status`: Pico connection, progress and upload errors
+- `POST /api/pico/start`: start one sensor run
 - `GET /api/ozone`: newest record (kept as the endpoint name)
 - `GET /api/ozone/history`: newest 100 records (`?limit=` up to 500)
 - `GET /api/ozone/<id>`: one record by its MongoDB id
@@ -74,36 +75,50 @@ Endpoints on `http://localhost:8001`:
 During development Vite proxies `/api` to the API. The dashboard has a record
 picker with Older/Newer buttons for browsing past windows.
 
-## Pico (MicroPython over USB)
+## Pico sensor setup
 
-The Pico is connected to the computer by USB. The bridge script
-[`scripts/serial_bridge.py`](./scripts/serial_bridge.py) runs
-[`pico/main.py`](./pico/main.py) on the Pico (via `mpremote`) and forwards each
-reading (MQ135, temperature, humidity) to the API on `localhost`. Nothing is saved on the Pico and nothing runs
-on power-up; the Pico also serves a Wi-Fi drive page (below).
+The Pico W runs the sensor service and creates `Cutebot-Pico` Wi-Fi by default.
+It does not host a web page or control the vehicle. Use a separate controller for
+the vehicle. The dashboard API polls the Pico, stores its readings and sends start
+commands; no separate Wi-Fi bridge is required.
 
-1. Wire the DHT22 data pin to **GP16** (VCC 3.3 V, GND). The Cutebot uses I2C on GP4/GP5.
-2. Wire the MQ135 `AO` pin to **GP26 (ADC0)**, `VCC` to 5 V (VBUS) and `GND` to
-   ground. `AO` can reach 5 V, but the Pico ADC tolerates 3.3 V at most, so
-   reduce it with a resistor divider (e.g. 10 kΩ + 20 kΩ). Because of this, the
-   readings do not span the full 0–65535 range.
-3. **Close Thonny** (only one program can use the serial port) and make sure
-   `npm run api` is running.
-4. Install the bridge dependencies once: `pip install pyserial mpremote`.
-5. Run `py scripts\serial_bridge.py` (add a port such as `COM5` if the Pico is
-   not detected automatically).
+1. Connect the DHT22 data to **GP16**, VCC to 3.3 V and GND to ground.
+2. Connect the MQ135 AO to **GP26 (ADC0)** through a voltage divider: 10 kohm
+   between AO and GP26, and 20 kohm between GP26 and GND. Connect VCC to a
+   suitable 5 V supply and GND to ground. Do not feed a 5 V signal directly
+   into a Pico GPIO. Confirm your particular MQ135 module's supply requirements.
+3. With the Pico connected by USB and Thonny closed, upload the firmware once:
 
-Join the Wi-Fi `Cutebot-Pico` (password `password123`) and open http://192.168.4.1 to drive the Cutebot (W/A/S/D) and press **Start reading**. The Pico takes 30
-readings 2 seconds apart, then the bridge exits.
+   ```powershell
+   mpremote connect COM3 cp pico\main.py :main.py
+   mpremote connect COM3 reset
+   ```
 
-### Running without USB
+   Use the actual Pico port instead of COM3. The Pico runs `main.py` on power-up.
+   If `mpremote` is missing, install it in your Python environment first.
+4. Connect the PC to `Cutebot-Pico` (password `password123`). Keep a separate
+   internet connection for MongoDB Atlas; for example, use a second Wi-Fi
+   adapter or USB tethering. Add the internet connection's public IP to Atlas
+   Network Access. Managed school computers may restrict simultaneous networks.
+5. Run `npm run live` and `npm run dev`, then open the Vite dashboard. The Pico
+   panel shows its connection and progress; press **Start reading** there. It
+   takes 30 samples approximately two seconds apart and updates the latest record.
 
-The Pico stores its latest 100 readings; a script on the PC polls them and forwards them to the API.
+Optionally copy `pico/config.example.py` to `pico/config.py`, set a 2.4 GHz
+Wi-Fi network and upload it as `:config.py`. Set `PICO_URL` in the root `.env`
+to the Pico's address on that network and restart the API. If the Pico cannot
+join it, it falls back to `Cutebot-Pico` at `192.168.4.1`; adjust `PICO_URL` if
+needed. No configuration file is needed for access-point mode. If an older
+`config.py` is already saved on the Pico, its Wi-Fi settings still apply; update
+it or back it up and remove it to return to access-point mode.
 
-1. Copy `pico/config.example.py` to `pico/config.py` and leave `WIFI_SSID` empty so the Pico makes its own Wi-Fi.
-2. With the Pico plugged in once (close Thonny): `mpremote connect COM3 cp pico\config.py :config.py` and `mpremote connect COM3 cp pico\main.py :main.py`.
-3. The PC needs two connections: one adapter on `Cutebot-Pico` (password `password123`) and one with internet (not a school-managed network, whose policy drops the second connection). Add the internet connection's public IP to MongoDB Atlas Network Access.
-4. Run `npm run live`. It starts the API and `scripts/wifi_bridge.py` together; open http://192.168.4.1, drive and press **Start reading**. Readings reach the dashboard automatically.
+The Pico keeps the latest 100 readings only in RAM. The API retries failed
+uploads while the Pico remains powered; resetting the Pico or losing more than
+100 readings before collection can lose data. Upload failures and gaps are
+shown on the dashboard; restart the API to acknowledge a reported gap after
+reviewing it. The existing serial and Wi-Fi bridge scripts are legacy:
+do not run them alongside `npm run live`, as readings may be duplicated. The
+Pico sensor API has no authentication; use it only on a trusted network.
 
 ## Build
 
