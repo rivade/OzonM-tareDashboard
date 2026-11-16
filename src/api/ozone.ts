@@ -1,11 +1,11 @@
 export const MAX_ADC_VALUE = 65535
 
-// Same conversion as the Pico's LCD: ADC pin voltage (3.3 V reference) scaled back
+// ADC pin voltage (3.3 V reference) scaled back
 // up by 1.5 for the 10k/20k divider that brings the MQ135's 5 V output down.
 export const SENSOR_MAX_VOLTS = 3.3 * 1.5
 export const toVolts = (adc: number) => (adc / MAX_ADC_VALUE) * SENSOR_MAX_VOLTS
 
-// Air-quality thresholds, as on the Pico's LCD.
+// Air-quality thresholds.
 export const MODERATE_VOLTS = 1.2
 export const POOR_VOLTS = 2.2
 

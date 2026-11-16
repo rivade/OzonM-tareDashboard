@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "api": "node server/index.js",
+    "live": "npm run api",
     "build": "run-p type-check \"build-only {@}\" --",
     "preview": "vite preview",
     "build-only": "vite build",

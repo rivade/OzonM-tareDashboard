@@ -1,174 +1,36 @@
-"""Pico air monitor: MQ135 (raw ADC) + DHT22 (temperature, humidity) with an LCD.
+"""Wi-Fi sensor service for the air quality dashboard.
 
-Wiring: MQ135 AO -> GP26 (ADC0) through a 10k/20k divider (5 V -> 3.3 V),
-DHT22 data -> GP16, ST7789 320x240 LCD on SPI1 (pins below).
-
-After a warm-up the script takes READINGS_PER_RUN readings, one every 2 seconds,
-shows them on the LCD, and prints each as a line `mq135_raw,temp_c,humidity` over
-USB (temp/humidity are empty when the DHT22 read fails). It then prints DONE and
-stops. scripts/serial_bridge.py runs this file and forwards the readings to the
-dashboard API.
+MQ135 AO connects to GP26 via a 10k/20k divider; DHT22 data to GP16.
+No vehicle control or web page is hosted by this firmware.
 """
 
-import framebuf
-import gc
+import json
+import network
+import socket
 import time
+import urandom
 import dht
-from machine import ADC, PWM, SPI, Pin
+from machine import ADC, Pin
 
-# Clear RAM before allocating framebuffer
-gc.collect()
+try:
+    import config
+except ImportError:
+    config = None
 
-# --- Pin Configuration ---
-DC_PIN = 8
-CS_PIN = 9
-SCK_PIN = 10
-MOSI_PIN = 11
-RST_PIN = 12
-BL_PIN = 13
 DHT_PIN = 16
-MQ135_PIN = 26  # ADC0 pin connected to MQ135 voltage divider
-
-WIDTH = 320
-HEIGHT = 240
-
-# --- Run settings ---
+MQ135_PIN = 26
+MAX_STORED = 100
 READINGS_PER_RUN = 30
 READING_INTERVAL_MS = 2000
-WARMUP_S = 10  # the MQ135 heater needs time to stabilise; longer is better
-SAMPLES_PER_READING = 8  # ADC samples averaged into each reading
+WARMUP_S = 10
+SAMPLES_PER_READING = 8
 SAMPLE_DELAY_MS = 20
 
-
-class PicoLCD20(framebuf.FrameBuffer):
-
-    def __init__(self):
-        self.width = WIDTH
-        self.height = HEIGHT
-
-        self.cs = Pin(CS_PIN, Pin.OUT)
-        self.rst = Pin(RST_PIN, Pin.OUT)
-        self.dc = Pin(DC_PIN, Pin.OUT)
-
-        self.cs(1)
-        self.dc(1)
-
-        self.spi = SPI(
-            1,
-            20_000_000,
-            polarity=0,
-            phase=0,
-            sck=Pin(SCK_PIN),
-            mosi=Pin(MOSI_PIN),
-            miso=None,
-        )
-
-        self.buffer = bytearray(self.height * self.width * 2)
-        super().__init__(self.buffer, self.width, self.height, framebuf.RGB565)
-
-        self.init_display()
-
-    def write_cmd(self, cmd):
-        self.cs(1)
-        self.dc(0)
-        self.cs(0)
-        self.spi.write(bytearray([cmd]))
-        self.cs(1)
-
-    def write_data(self, buf):
-        self.cs(1)
-        self.dc(1)
-        self.cs(0)
-        self.spi.write(bytearray([buf]))
-        self.cs(1)
-
-    def init_display(self):
-        self.rst(1)
-        time.sleep_ms(10)
-        self.rst(0)
-        time.sleep_ms(10)
-        self.rst(1)
-        time.sleep_ms(10)
-
-        self.write_cmd(0x36)
-        self.write_data(0x70)
-
-        self.write_cmd(0x3A)
-        self.write_data(0x05)
-
-        self.write_cmd(0xB2)
-        for val in [0x0C, 0x0C, 0x00, 0x33, 0x33]:
-            self.write_data(val)
-
-        self.write_cmd(0xB7)
-        self.write_data(0x35)
-        self.write_cmd(0xBB)
-        self.write_data(0x19)
-        self.write_cmd(0xC0)
-        self.write_data(0x2C)
-        self.write_cmd(0xC2)
-        self.write_data(0x01)
-        self.write_cmd(0xC3)
-        self.write_data(0x12)
-        self.write_cmd(0xC4)
-        self.write_data(0x20)
-        self.write_cmd(0xC6)
-        self.write_data(0x0F)
-        self.write_cmd(0xD0)
-        self.write_data(0xA4)
-        self.write_data(0xA1)
-
-        self.write_cmd(0x21)
-        self.write_cmd(0x11)
-        time.sleep_ms(120)
-        self.write_cmd(0x29)
-
-    def show(self):
-        self.write_cmd(0x2A)
-        self.write_data(0x00)
-        self.write_data(0x00)
-        self.write_data(0x01)
-        self.write_data(0x3F)
-
-        self.write_cmd(0x2B)
-        self.write_data(0x00)
-        self.write_data(0x00)
-        self.write_data(0x00)
-        self.write_data(0xEF)
-
-        self.write_cmd(0x2C)
-
-        self.cs(1)
-        self.dc(1)
-        self.cs(0)
-        self.spi.write(self.buffer)
-        self.cs(1)
-
-
-def color565(r, g, b):
-    c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-    return ((c & 0xFF) << 8) | ((c >> 8) & 0xFF)
-
-
-# PWM Backlight
-pwm = PWM(Pin(BL_PIN))
-pwm.freq(1000)
-pwm.duty_u16(45000)
-
-# Display & Sensor Setup
-lcd = PicoLCD20()
+led = Pin("LED", Pin.OUT)
 dht_sensor = dht.DHT22(Pin(DHT_PIN, Pin.IN, Pin.PULL_UP))
 mq135_adc = ADC(Pin(MQ135_PIN))
-
-# Palette
-BLACK = color565(0, 0, 0)
-WHITE = color565(255, 255, 255)
-BLUE = color565(0, 100, 220)
-CYAN = color565(0, 220, 255)
-GREEN = color565(0, 255, 64)
-YELLOW = color565(255, 220, 0)
-RED = color565(255, 50, 50)
-DARK_GRAY = color565(25, 25, 25)
+boot_ms = time.ticks_ms()
+boot_id = "%08x%08x" % (urandom.getrandbits(30), urandom.getrandbits(30))
 
 
 def read_mq135():
@@ -189,86 +51,134 @@ def read_dht():
         return None, None
 
 
-def draw_screen(raw_adc, temp_c, humidity, footer):
-    lcd.fill(BLACK)
-
-    # Header Bar
-    lcd.rect(0, 0, 320, 30, BLUE, True)
-    lcd.text("PICO AIR & TEMP MONITOR", 65, 10, WHITE)
-
-    # Categorize Air Quality Level
-    v_pin = (raw_adc / 65535) * 3.3
-    v_sensor = v_pin * 1.5  # Accounts for 10k/20k divider (5V -> 3.3V)
-    if v_sensor < 1.2:
-        air_status = "Good"
-        air_color = GREEN
-    elif v_sensor < 2.2:
-        air_status = "Moderate"
-        air_color = YELLOW
-    else:
-        air_status = "Poor / High Gas"
-        air_color = RED
-
-    # Temperature Box
-    lcd.rect(10, 36, 300, 48, DARK_GRAY, True)
-    lcd.text("TEMPERATURE", 20, 42, CYAN)
-    # Humidity Box
-    lcd.rect(10, 90, 300, 48, DARK_GRAY, True)
-    lcd.text("HUMIDITY", 20, 96, CYAN)
-    if temp_c is None:
-        lcd.text("Sensor Error", 30, 62, RED)
-        lcd.text("Sensor Error", 30, 116, RED)
-    else:
-        temp_f = (temp_c * 9 / 5) + 32
-        lcd.text(f"{temp_c:.1f} C  /  {temp_f:.1f} F", 30, 62, GREEN)
-        lcd.text(f"{humidity:.1f} %", 30, 116, GREEN)
-
-    # Air Quality Box (MQ135)
-    lcd.rect(10, 144, 300, 48, DARK_GRAY, True)
-    lcd.text("AIR QUALITY (MQ135)", 20, 150, CYAN)
-    lcd.text(f"{v_sensor:.2f}V - {air_status}", 30, 170, air_color)
-
-    lcd.text(footer, 10, 218, WHITE)
-    lcd.show()
+def connect_wifi():
+    # Returns True when joined to the configured network.
+    if config is None or not getattr(config, "WIFI_SSID", ""):
+        return False
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(config.WIFI_SSID, config.WIFI_PASSWORD)
+    for _ in range(30):
+        if wlan.isconnected():
+            print("Wi-Fi joined, open http://%s" % wlan.ifconfig()[0])
+            return True
+        led.toggle()
+        time.sleep_ms(500)
+    wlan.active(False)
+    return False
 
 
-def show_message(text):
-    lcd.fill(BLACK)
-    lcd.rect(0, 0, 320, 30, BLUE, True)
-    lcd.text("PICO AIR & TEMP MONITOR", 65, 10, WHITE)
-    lcd.text(text, 10, 110, WHITE)
-    lcd.show()
+def send_json(conn, body, status="200 OK"):
+    conn.sendall(
+        b"HTTP/1.1 " + status.encode() + b"\r\nContent-Type: application/json\r\n"
+        b"Cache-Control: no-store\r\nContent-Length: "
+        + str(len(body)).encode()
+        + b"\r\nConnection: close\r\n\r\n"
+        + body
+    )
+
+
+def close_after_client(conn):
+    # Let the client close first: a connection the Pico closes itself lingers in
+    # TIME_WAIT, and the small TCP table fills up after a few requests.
+    try:
+        conn.settimeout(0.3)
+        conn.recv(1)
+    except OSError:
+        pass
+    conn.close()
+
 
 
 def main():
-    print("Warming up sensor for %d s..." % WARMUP_S)
-    for left in range(WARMUP_S, 0, -1):
-        if left % 5 == 0:
-            show_message("Warming up sensor: %d s" % left)
-        time.sleep(1)
+    if not connect_wifi():
+        ap = network.WLAN(network.AP_IF)
+        ap.config(essid="Cutebot-Pico", password="password123")
+        ap.active(True)
+        print("Access point Cutebot-Pico, http://192.168.4.1")
+    led.on()
 
-    for number in range(1, READINGS_PER_RUN + 1):
-        started = time.ticks_ms()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("", 80))
+    server.listen(2)
+    server.settimeout(0.05)
 
-        raw_adc = read_mq135()
-        temp_c, humidity = read_dht()
-        if temp_c is None:
-            print("%d,," % raw_adc)
-        else:
-            print("%d,%.1f,%.1f" % (raw_adc, temp_c, humidity))
-        draw_screen(raw_adc, temp_c, humidity, "Reading %d/%d" % (number, READINGS_PER_RUN))
+    state = "idle"
+    count = 0
+    next_reading = 0
+    seen = 0
+    stored = []
 
-        # Keep a steady cadence regardless of how long the reading took.
-        elapsed = time.ticks_diff(time.ticks_ms(), started)
-        time.sleep_ms(max(0, READING_INTERVAL_MS - elapsed))
+    try:
+        while True:
+            conn = None
+            try:
+                conn, _ = server.accept()
+                conn.settimeout(0.5)
+                request = conn.recv(512).decode("utf-8")
+                parts = request.split(" ", 2)
+                method = parts[0] if len(parts) > 1 else ""
+                target = parts[1] if len(parts) > 1 else ""
+                path = target.split("?", 1)[0]
 
-    show_message("Done - %d readings sent" % READINGS_PER_RUN)
-    print("DONE")
+                if method == "GET" and path == "/readings":
+                    since = 0
+                    if "?" in target:
+                        query = target.split("?", 1)[1]
+                        for part in query.split("&"):
+                            if part.startswith("since="):
+                                since = int(part[6:])
+                    if since < 0:
+                        raise ValueError("since must be non-negative")
+                    first = seen - len(stored) + 1
+                    start = min(len(stored), max(0, since + 1 - first))
+                    body = {"protocol": 1, "boot": boot_id, "seen": seen,
+                            "first": first, "state": state, "count": count,
+                            "total": READINGS_PER_RUN, "readings": stored[start:]}
+                    send_json(conn, json.dumps(body).encode("utf-8"))
+                elif method == "POST" and path == "/start":
+                    if state in ("warmup", "reading"):
+                        send_json(conn, b'{"error":"A reading is already in progress."}', "409 Conflict")
+                    else:
+                        state = "warmup"
+                        count = 0
+                        send_json(conn, b'{"started":true}')
+                else:
+                    send_json(conn, b'{"error":"Not found."}', "404 Not Found")
+            except (ValueError, UnicodeError) as error:
+                print("Invalid request:", error)
+                if conn is not None:
+                    send_json(conn, b'{"error":"Invalid request."}', "400 Bad Request")
+            except OSError as error:
+                if conn is not None:
+                    print("Connection error:", error)
+            finally:
+                if conn is not None:
+                    close_after_client(conn)
+
+            if state == "warmup" and time.ticks_diff(time.ticks_ms(), boot_ms) >= WARMUP_S * 1000:
+                state = "reading"
+                next_reading = time.ticks_ms()
+                print("Warm-up done, reading...")
+            elif state == "reading" and time.ticks_diff(time.ticks_ms(), next_reading) >= 0:
+                next_reading = time.ticks_add(time.ticks_ms(), READING_INTERVAL_MS)
+                raw_adc = read_mq135()
+                temp_c, humidity = read_dht()
+                count += 1
+                if temp_c is None:
+                    print("%d,," % raw_adc)
+                else:
+                    print("%d,%.1f,%.1f" % (raw_adc, temp_c, humidity))
+                seen += 1
+                stored.append({"value": raw_adc, "temperature": temp_c, "humidity": humidity})
+                del stored[:-MAX_STORED]
+                if count >= READINGS_PER_RUN:
+                    state = "done"
+                    print("DONE")
+    finally:
+        server.close()
+        led.off()
 
 
-try:
-    main()
-except KeyboardInterrupt:
-    lcd.fill(BLACK)
-    lcd.show()
-    pwm.duty_u16(0)
+main()

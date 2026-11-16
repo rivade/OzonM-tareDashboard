@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import { createServer } from 'node:http'
 import { MongoClient, ObjectId } from 'mongodb'
+import { createPicoService } from './pico.js'
 
 const { MONGODB_URI, MONGODB_DATABASE, MONGODB_COLLECTION, API_TOKEN } = process.env
 const port = Number(process.env.API_PORT ?? 8001)
@@ -97,6 +98,59 @@ async function start() {
   await client.connect()
   const collection = client.db(MONGODB_DATABASE).collection(MONGODB_COLLECTION)
 
+  async function saveReading({ value, temperature = null, humidity = null }, picoId = null) {
+    if (!isAdcValue(value) || !isOptionalInRange(temperature, temperatureRange) || !isOptionalInRange(humidity, humidityRange)) {
+      throw new Error('Invalid sensor reading from Pico.')
+    }
+    // Append to the open window if it is not full and still receiving readings;
+    // otherwise start a new window.
+    const now = new Date()
+    if (picoId && await collection.findOne({ picoIds: picoId }, { projection: { _id: 1 } })) return null
+    const window = await collection.findOneAndUpdate(
+      {
+        values: { $type: 'array' },
+        [`values.${samplesPerWindow - 1}`]: { $exists: false },
+        updatedAt: { $gte: new Date(now.getTime() - windowGapMs) },
+      },
+      { $push: { values: value, temperatures: temperature, humidities: humidity, ...(picoId ? { picoIds: picoId } : {}) }, $set: { updatedAt: now } },
+      { sort: { [timestampField]: -1 }, returnDocument: 'after' },
+    )
+    if (!window) {
+      await collection.insertOne({
+        [timestampField]: now,
+        updatedAt: now,
+        values: [value],
+        temperatures: [temperature],
+        humidities: [humidity],
+        ...(picoId ? { picoIds: [picoId] } : {}),
+      })
+    }
+    return { sample: window ? window.values.length : 1, of: samplesPerWindow, value, temperature, humidity }
+  }
+
+  async function loadPicoCursor(boot) {
+    const records = await collection.find(
+      { picoIds: { $regex: `^${boot}:` } },
+      { projection: { picoIds: 1 } },
+    ).toArray()
+    let latest = 0
+    for (const record of records) {
+      for (const id of record.picoIds) {
+        if (id.startsWith(`${boot}:`)) {
+          const number = Number(id.slice(boot.length + 1))
+          if (Number.isSafeInteger(number) && number > latest) latest = number
+        }
+      }
+    }
+    return latest
+  }
+
+  const pico = createPicoService({
+    url: process.env.PICO_URL || 'http://192.168.4.1',
+    saveReading,
+    loadCursor: loadPicoCursor,
+  })
+
   function toReading(document) {
     const timestamp = document[timestampField]
     if (!(timestamp instanceof Date) || Number.isNaN(timestamp.getTime())) {
@@ -109,6 +163,23 @@ async function start() {
     const url = new URL(request.url ?? '/', 'http://localhost')
 
     try {
+      if (request.method === 'GET' && url.pathname === '/api/pico/status') {
+        sendJson(response, 200, pico.status())
+        return
+      }
+      if (request.method === 'POST' && url.pathname === '/api/pico/start') {
+        if (request.headers['sec-fetch-site'] === 'cross-site' || !request.headers['content-type']?.startsWith('application/json')) {
+          sendJson(response, 403, { error: 'Invalid start request.' })
+          return
+        }
+        try {
+          await pico.startReading()
+          sendJson(response, 200, { started: true })
+        } catch (error) {
+          sendJson(response, 409, { error: error instanceof Error ? error.message : 'Could not start reading.' })
+        }
+        return
+      }
       if (request.method === 'POST' && url.pathname === '/api/readings') {
         if (!API_TOKEN) {
           sendJson(response, 503, { error: 'Set API_TOKEN in .env to accept sensor readings.' })
@@ -140,28 +211,8 @@ async function start() {
         temperature ??= null
         humidity ??= null
 
-        // Append to the open window if it is not full and still receiving readings;
-        // otherwise start a new window.
-        const now = new Date()
-        const window = await collection.findOneAndUpdate(
-          {
-            values: { $type: 'array' },
-            [`values.${samplesPerWindow - 1}`]: { $exists: false },
-            updatedAt: { $gte: new Date(now.getTime() - windowGapMs) },
-          },
-          { $push: { values: value, temperatures: temperature, humidities: humidity }, $set: { updatedAt: now } },
-          { sort: { [timestampField]: -1 }, returnDocument: 'after' },
-        )
-        if (!window) {
-          await collection.insertOne({
-            [timestampField]: now,
-            updatedAt: now,
-            values: [value],
-            temperatures: [temperature],
-            humidities: [humidity],
-          })
-        }
-        sendJson(response, 200, { sample: window ? window.values.length : 1, of: samplesPerWindow, value, temperature, humidity })
+        const result = await saveReading({ value, temperature, humidity })
+        sendJson(response, 200, result)
         return
       }
 
@@ -224,9 +275,11 @@ async function start() {
 
   server.listen(port, host, () => {
     console.log(`Sensor API listening on ${host}:${port}`)
+    pico.start()
   })
 
   const shutdown = async () => {
+    pico.stop()
     server.close()
     await client.close()
   }

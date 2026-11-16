@@ -41,3 +41,7 @@ __screenshots__/
 # Vite
 *.timestamp-*-*.mjs
 
+__pycache__
+
+# Pico Wi-Fi/API secrets
+pico/config.py
